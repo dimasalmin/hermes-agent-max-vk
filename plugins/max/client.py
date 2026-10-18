@@ -1,0 +1,659 @@
+"""Minimal MAX Bot API v2 HTTP client.
+
+The client deliberately uses the documented REST surface instead of the
+older third-party Python SDK.  This keeps the Hermes plugin independent from
+SDK release timing and makes authorization/TLS behavior testable.
+"""
+
+from __future__ import annotations
+
+import ipaddress
+import re
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Optional
+from urllib.parse import quote, urljoin, urlsplit
+
+import httpx
+
+from .media import DEFAULT_MEDIA_HOSTS, is_allowed_media_url
+from .media import validate_image_dimensions
+
+DEFAULT_API_BASE = "https://platform-api2.max.ru"
+DEFAULT_TIMEOUT = httpx.Timeout(connect=15.0, read=60.0, write=60.0, pool=15.0)
+_SECRET_PATTERN = re.compile(r"^[A-Za-z0-9_-]{5,256}$")
+MAX_UPLOAD_TYPES = frozenset({"image", "video", "audio", "file"})
+DEFAULT_MEDIA_MAX_BYTES = 50_000_000
+
+
+def _attachment_token(value: Any) -> Optional[str]:
+    """Extract a MAX attachment token from all documented response shapes."""
+
+    if not isinstance(value, Mapping):
+        return None
+    direct = value.get("token")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    for key in ("photos", "payload", "result"):
+        nested = value.get(key)
+        if isinstance(nested, Mapping):
+            token = _attachment_token(nested)
+            if token:
+                return token
+            # The live image upload response uses an opaque photo id as the
+            # mapping key: {"photos": {"<id>": {"token": "..."}}}.
+            if key == "photos":
+                for item in list(nested.values())[:32]:
+                    token = _attachment_token(item)
+                    if token:
+                        return token
+        elif isinstance(nested, (list, tuple)):
+            for item in nested:
+                token = _attachment_token(item)
+                if token:
+                    return token
+    return None
+
+
+class MaxApiError(RuntimeError):
+    """An API or transport error with machine-readable retry information."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: Optional[int] = None,
+        code: Optional[str] = None,
+        retry_after: Optional[float] = None,
+        retryable: bool = False,
+        outcome_uncertain: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.retry_after = retry_after
+        self.retryable = retryable
+        self.outcome_uncertain = outcome_uncertain
+
+
+def _retry_after(response: httpx.Response) -> Optional[float]:
+    value = response.headers.get("Retry-After")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _error_code(error: Mapping[str, Any]) -> Optional[str]:
+    code = error.get("code")
+    if code and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", str(code)):
+        return str(code)
+    detail = str(error.get("message") or "").lower()
+    if "attachment.not.ready" in detail or "attachment.file.not.processed" in detail:
+        return "attachment.not.ready"
+    if any(
+        marker in detail
+        for marker in (
+            "unsupported audio",
+            "unsupported media format",
+            "unsupported file type",
+            "file extension forbidden",
+            "file extension is forbidden",
+            "invalid audio format",
+        )
+    ):
+        return "unsupported_audio_format"
+    return None
+
+
+class MaxClient:
+    """Async client for the current MAX Bot API v2 endpoint."""
+
+    def __init__(
+        self,
+        token: str,
+        *,
+        base_url: str = DEFAULT_API_BASE,
+        timeout: httpx.Timeout | float = DEFAULT_TIMEOUT,
+        verify: bool | str = True,
+        http_client: Optional[httpx.AsyncClient] = None,
+        media_http_client: Optional[httpx.AsyncClient] = None,
+    ) -> None:
+        token = token.strip()
+        if not token:
+            raise ValueError("MAX bot token must not be empty")
+        self._token = token
+        self._timeout = timeout
+        self._verify = verify
+        self.base_url = base_url.rstrip("/")
+        self._http = http_client or httpx.AsyncClient(
+            base_url=self.base_url,
+            headers={"Authorization": token},
+            timeout=timeout,
+            verify=verify,
+        )
+        # Keep CDN/upload traffic on a separate client without default auth
+        # headers. The bot token must never be sent to a signed media URL.
+        self._media_http = media_http_client
+        # A supplied client is primarily a test/integration seam.  Its
+        # existing base URL and transport remain intact, but auth is owned by
+        # this client so callers cannot accidentally omit the header.
+        self._http.headers["Authorization"] = token
+
+    async def close(self) -> None:
+        await self._http.aclose()
+        if self._media_http is not None and self._media_http is not self._http:
+            await self._media_http.aclose()
+
+    def _get_media_http(self) -> httpx.AsyncClient:
+        if self._media_http is None:
+            self._media_http = httpx.AsyncClient(
+                timeout=self._timeout,
+                verify=self._verify,
+                follow_redirects=False,
+            )
+        return self._media_http
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Mapping[str, Any]] = None,
+        json: Optional[Mapping[str, Any]] = None,
+        files: Any = None,
+        headers: Optional[Mapping[str, str]] = None,
+    ) -> Any:
+        try:
+            response = await self._http.request(
+                method,
+                path,
+                params=params,
+                json=json,
+                files=files,
+                headers=headers,
+            )
+        except httpx.RequestError as exc:
+            outcome_uncertain = method.upper() == "POST" and path == "/messages"
+            raise MaxApiError(
+                f"MAX transport error: {exc.__class__.__name__}",
+                code="transport_error",
+                retryable=not outcome_uncertain,
+                outcome_uncertain=outcome_uncertain,
+            ) from exc
+
+        json_parse_failed = False
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+            json_parse_failed = True
+
+        if response.status_code >= 400:
+            error = payload if isinstance(payload, Mapping) else {}
+            code = _error_code(error)
+            outcome_uncertain = (
+                method.upper() == "POST"
+                and path == "/messages"
+                and response.status_code >= 500
+            )
+            retryable = response.status_code == 429 or (
+                response.status_code >= 500 and not outcome_uncertain
+            )
+            raise MaxApiError(
+                f"MAX API {response.status_code}: {code or 'request_failed'}",
+                status_code=response.status_code,
+                code=code,
+                retry_after=_retry_after(response),
+                retryable=retryable,
+                outcome_uncertain=outcome_uncertain,
+            )
+
+        if not isinstance(payload, Mapping):
+            code = "invalid_json" if json_parse_failed else "invalid_response"
+            raise MaxApiError(
+                "MAX API returned an invalid success response",
+                status_code=response.status_code,
+                code=code,
+                retryable=method.upper() == "GET",
+                outcome_uncertain=method.upper() == "POST" and path == "/messages",
+            )
+
+        return payload
+
+    async def get_me(self) -> Mapping[str, Any]:
+        result = await self._request("GET", "/me")
+        if not str(result.get("user_id") or "").strip():
+            raise MaxApiError("MAX API returned no bot identity", code="invalid_me_response")
+        return result
+
+    async def set_bot_commands(
+        self, commands: Iterable[Mapping[str, str]]
+    ) -> Mapping[str, Any]:
+        """Replace the slash-command menu exposed by MAX."""
+
+        normalized: list[dict[str, str]] = []
+        for command in commands:
+            if not isinstance(command, Mapping):
+                continue
+            name = str(command.get("name") or "").strip().lstrip("/").lower()
+            description = str(command.get("description") or "").strip()
+            if not re.fullmatch(r"[a-z0-9_]{1,32}", name) or not description:
+                continue
+            normalized.append({"name": name, "description": description[:128]})
+        if len(normalized) > 32:
+            normalized = normalized[:32]
+        return await self._request("PATCH", "/me/commands", json={"commands": normalized})
+
+    async def send_action(self, chat_id: str, action: str) -> Mapping[str, Any]:
+        """Send a documented MAX chat action such as ``typing_on``."""
+
+        chat_id = str(chat_id).strip()
+        action = str(action).strip().lower()
+        if not chat_id or not re.fullmatch(r"[a-z0-9_.:-]{1,256}", action):
+            raise ValueError("MAX chat action arguments are invalid")
+        result = await self._request(
+            "POST",
+            f"/chats/{quote(chat_id, safe='')}/actions",
+            json={"action": action},
+        )
+        if result.get("success") is not True:
+            raise MaxApiError("MAX chat action was not acknowledged", code="action_rejected")
+        return result
+
+    async def get_video(self, video_token: str) -> Mapping[str, Any]:
+        """Resolve an inbound MAX video token into downloadable URLs."""
+
+        video_token = str(video_token).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,512}", video_token):
+            raise ValueError("MAX video token is invalid")
+        result = await self._request("GET", f"/videos/{quote(video_token, safe='')}")
+        return result if isinstance(result, Mapping) else {}
+
+    async def download_media(
+        self,
+        url: str,
+        *,
+        max_bytes: int = DEFAULT_MEDIA_MAX_BYTES,
+        allowed_hosts: tuple[str, ...] = DEFAULT_MEDIA_HOSTS,
+    ) -> tuple[bytes, str]:
+        """Download one inbound MAX attachment with bounded size and redirects."""
+
+        if not is_allowed_media_url(url, allowed_hosts=allowed_hosts):
+            raise MaxApiError("MAX media URL is not allowed")
+        if max_bytes <= 0:
+            raise ValueError("MAX media max_bytes must be positive")
+        max_bytes = min(int(max_bytes), DEFAULT_MEDIA_MAX_BYTES)
+
+        current_url = str(url)
+        media_http = self._get_media_http()
+        try:
+            for _ in range(4):
+                if not is_allowed_media_url(current_url, allowed_hosts=allowed_hosts):
+                    raise MaxApiError("MAX media redirect URL is not allowed")
+                async with media_http.stream(
+                    "GET", current_url, follow_redirects=False
+                ) as response:
+                    if 300 <= response.status_code < 400:
+                        location = response.headers.get("Location")
+                        if not location:
+                            raise MaxApiError("MAX media redirect has no location")
+                        current_url = urljoin(current_url, location)
+                        continue
+                    if response.status_code >= 400:
+                        raise MaxApiError(
+                            f"MAX media download HTTP {response.status_code}",
+                            status_code=response.status_code,
+                            retryable=response.status_code == 429 or response.status_code >= 500,
+                            retry_after=_retry_after(response),
+                        )
+                    content_length = response.headers.get("Content-Length")
+                    try:
+                        if content_length is not None and int(content_length) > max_bytes:
+                            raise MaxApiError("MAX media attachment exceeds configured size limit")
+                    except ValueError:
+                        pass
+                    data = bytearray()
+                    async for chunk in response.aiter_bytes(64 * 1024):
+                        data.extend(chunk)
+                        if len(data) > max_bytes:
+                            raise MaxApiError("MAX media attachment exceeds configured size limit")
+                    content_type = response.headers.get("Content-Type", "")
+                    return bytes(data), content_type.split(";", 1)[0].strip().lower()
+            raise MaxApiError("MAX media redirect limit exceeded")
+        except httpx.RequestError as exc:
+            raise MaxApiError(
+                f"MAX media transport error: {exc.__class__.__name__}",
+                retryable=True,
+            ) from exc
+
+    async def _upload_multipart(
+        self,
+        upload_info: Mapping[str, Any],
+        *,
+        filename: str,
+        content: Any,
+        content_type: str,
+        media_type: str,
+    ) -> Mapping[str, Any]:
+        if not isinstance(upload_info, Mapping):
+            raise MaxApiError("MAX returned an invalid media upload response")
+        upload_url = str(upload_info.get("url") or "").strip()
+        if not upload_url or not is_allowed_media_url(upload_url):
+            raise MaxApiError("MAX returned an invalid media upload URL")
+        media_http = self._get_media_http()
+        try:
+            response = await media_http.post(
+                upload_url,
+                files={"data": (filename, content, content_type)},
+                headers={"Accept": "application/json"},
+                follow_redirects=False,
+            )
+        except httpx.RequestError as exc:
+            raise MaxApiError(
+                f"MAX media upload transport error: {exc.__class__.__name__}",
+                retryable=True,
+            ) from exc
+
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+        if response.status_code >= 300:
+            error = payload if isinstance(payload, Mapping) else {}
+            detail = error.get("message") or response.reason_phrase or "MAX upload error"
+            raise MaxApiError(
+                f"MAX media upload HTTP {response.status_code}: {detail}",
+                status_code=response.status_code,
+                code=_error_code(error),
+                retry_after=_retry_after(response),
+                retryable=response.status_code == 429 or response.status_code >= 500,
+            )
+        if not isinstance(payload, Mapping):
+            payload = {}
+        result = dict(payload)
+        token = _attachment_token(result) or _attachment_token(upload_info)
+        reported_type = result.get("type") or upload_info.get("type")
+        if reported_type:
+            normalized_type = {"photo": "image", "document": "file"}.get(
+                str(reported_type).strip().lower(), str(reported_type).strip().lower()
+            )
+            requested_type = str(media_type).strip().lower()
+            if normalized_type in MAX_UPLOAD_TYPES and normalized_type != requested_type:
+                raise MaxApiError(
+                    f"MAX upload type mismatch: requested {requested_type}, received {normalized_type}"
+                )
+        if token:
+            result["token"] = token
+        if not token:
+            raise MaxApiError("MAX media upload returned no attachment token")
+        return result
+
+    async def upload_media(
+        self,
+        file_path: str | Path,
+        *,
+        media_type: str,
+        max_bytes: int = DEFAULT_MEDIA_MAX_BYTES,
+        mime_type: Optional[str] = None,
+        filename: Optional[str] = None,
+    ) -> Mapping[str, Any]:
+        """Upload a local file using the current MAX two-step token flow."""
+
+        media_type = str(media_type).strip().lower()
+        if media_type not in MAX_UPLOAD_TYPES:
+            raise ValueError(f"Unsupported MAX upload type: {media_type}")
+        if max_bytes <= 0:
+            raise ValueError("MAX media max_bytes must be positive")
+        max_bytes = min(int(max_bytes), DEFAULT_MEDIA_MAX_BYTES)
+        path = Path(file_path)
+        try:
+            if not path.is_file():
+                raise OSError("not a regular file")
+            size = path.stat().st_size
+        except OSError as exc:
+            raise MaxApiError(f"MAX media file is not readable: {path.name}") from exc
+        if size > max_bytes:
+            raise MaxApiError("MAX media file exceeds configured size limit")
+        if media_type == "image":
+            try:
+                validate_image_dimensions(path)
+            except ValueError as exc:
+                raise MaxApiError(str(exc)) from exc
+
+        upload_info = await self._request(
+            "POST", "/uploads", params={"type": media_type}
+        )
+        content_type = mime_type or {
+            "image": "image/jpeg",
+            "video": "video/mp4",
+            "audio": "audio/ogg",
+            "file": "application/octet-stream",
+        }[media_type]
+        try:
+            with path.open("rb") as file_obj:
+                return await self._upload_multipart(
+                    upload_info,
+                    filename=Path(str(filename or path.name)).name or path.name,
+                    content=file_obj,
+                    content_type=content_type,
+                    media_type=media_type,
+                )
+        except OSError as exc:
+            raise MaxApiError(
+                f"MAX media upload transport error: {exc.__class__.__name__}",
+                retryable=True,
+            ) from exc
+
+    async def upload_media_bytes(
+        self,
+        data: bytes,
+        *,
+        filename: str,
+        media_type: str,
+        max_bytes: int = DEFAULT_MEDIA_MAX_BYTES,
+        mime_type: Optional[str] = None,
+    ) -> Mapping[str, Any]:
+        """Upload bounded in-memory media fetched from an approved HTTPS URL."""
+
+        media_type = str(media_type).strip().lower()
+        if media_type not in MAX_UPLOAD_TYPES:
+            raise ValueError(f"Unsupported MAX upload type: {media_type}")
+        if max_bytes <= 0:
+            raise ValueError("MAX media max_bytes must be positive")
+        max_bytes = min(int(max_bytes), DEFAULT_MEDIA_MAX_BYTES)
+        if len(data) > max_bytes:
+            raise MaxApiError("MAX media file exceeds configured size limit")
+        if media_type == "image":
+            try:
+                validate_image_dimensions(data, filename=filename)
+            except ValueError as exc:
+                raise MaxApiError(str(exc)) from exc
+        safe_name = Path(str(filename or "attachment")).name or "attachment"
+        safe_name = "".join(
+            char for char in safe_name if ord(char) >= 32 and char != "\x7f"
+        )[:255]
+        upload_info = await self._request(
+            "POST", "/uploads", params={"type": media_type}
+        )
+        content_type = mime_type or {
+            "image": "image/jpeg",
+            "video": "video/mp4",
+            "audio": "audio/ogg",
+            "file": "application/octet-stream",
+        }[media_type]
+        return await self._upload_multipart(
+            upload_info,
+            filename=safe_name,
+            content=data,
+            content_type=content_type,
+            media_type=media_type,
+        )
+
+    async def send_message(
+        self,
+        target_id: str,
+        text: str,
+        *,
+        target_type: str = "user",
+        link: Optional[Mapping[str, Any]] = None,
+        attachments: Optional[Iterable[Mapping[str, Any]]] = None,
+        notify: bool = True,
+        format: str = "markdown",
+    ) -> Mapping[str, Any]:
+        if len(text) > 4000:
+            raise ValueError("MAX message text must not exceed 4000 characters")
+        if target_type not in {"user", "chat"}:
+            raise ValueError("target_type must be 'user' or 'chat'")
+        body: dict[str, Any] = {"text": text, "notify": notify, "format": format}
+        if link is not None:
+            body["link"] = dict(link)
+        if attachments is not None:
+            body["attachments"] = [dict(item) for item in attachments]
+        result = await self._request(
+            "POST",
+            "/messages",
+            params={"user_id" if target_type == "user" else "chat_id": target_id},
+            json=body,
+        )
+        message = result.get("message")
+        body_result = message.get("body") if isinstance(message, Mapping) else None
+        has_id = (
+            isinstance(body_result, Mapping) and bool(body_result.get("mid"))
+        ) or bool(result.get("message_id") or result.get("id"))
+        if not has_id:
+            raise MaxApiError(
+                "MAX API response did not confirm message creation",
+                code="missing_message_id",
+                outcome_uncertain=True,
+            )
+        return result
+
+    async def edit_message(
+        self,
+        message_id: str,
+        text: str,
+        *,
+        attachments: Optional[Iterable[Mapping[str, Any]]] = None,
+        notify: bool = True,
+        format: str = "markdown",
+    ) -> Mapping[str, Any]:
+        if len(text) > 4000:
+            raise ValueError("MAX message text must not exceed 4000 characters")
+        body: dict[str, Any] = {"text": text, "notify": notify, "format": format}
+        if attachments is not None:
+            body["attachments"] = [dict(item) for item in attachments]
+        return await self._request(
+            "PUT",
+            "/messages",
+            params={"message_id": message_id},
+            json=body,
+        )
+
+    async def answer_callback(
+        self,
+        callback_id: str,
+        *,
+        message: Optional[Mapping[str, Any]] = None,
+    ) -> Any:
+        """Acknowledge a button click and optionally replace its message."""
+
+        callback_id = str(callback_id).strip()
+        if not callback_id:
+            raise ValueError("MAX callback_id must not be empty")
+        body: dict[str, Any] = {}
+        if message is not None:
+            body["message"] = dict(message)
+        result = await self._request(
+            "POST",
+            "/answers",
+            params={"callback_id": callback_id},
+            json=body,
+        )
+        if result.get("success") is not True:
+            raise MaxApiError("MAX callback was not acknowledged", code="callback_rejected")
+        return result
+
+    async def subscribe_webhook(
+        self,
+        url: str,
+        secret: str,
+        *,
+        update_types: Optional[Iterable[str]] = None,
+    ) -> Mapping[str, Any]:
+        try:
+            parsed = urlsplit(str(url).strip())
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("MAX Webhook URL is invalid") from exc
+        if (
+            parsed.scheme.lower() != "https"
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or port not in (None, 443)
+        ):
+            raise ValueError("MAX Webhook URL must be public HTTPS on port 443")
+        try:
+            address = ipaddress.ip_address(parsed.hostname)
+        except ValueError:
+            address = None
+        if address is not None and not address.is_global:
+            raise ValueError("MAX Webhook URL must not point to a private or local address")
+        if not _SECRET_PATTERN.fullmatch(secret):
+            raise ValueError("MAX Webhook secret must match [A-Za-z0-9_-]{5,256}")
+        body: dict[str, Any] = {"url": url, "secret": secret}
+        if update_types is not None:
+            body["update_types"] = list(update_types)
+        result = await self._request("POST", "/subscriptions", json=body)
+        if result.get("success") is not True:
+            raise MaxApiError("MAX Webhook subscription was not confirmed", code="subscription_rejected")
+        return result
+
+    async def get_subscriptions(self) -> Any:
+        result = await self._request("GET", "/subscriptions")
+        subscriptions = result.get("subscriptions")
+        if not isinstance(subscriptions, list) or any(
+            not isinstance(item, Mapping) or not isinstance(item.get("url"), str)
+            for item in subscriptions
+        ):
+            raise MaxApiError("Invalid MAX subscriptions response", code="invalid_subscriptions_response")
+        return result
+
+    async def unsubscribe_webhook(self, url: str) -> Mapping[str, Any]:
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("A specific HTTPS subscription URL is required")
+        result = await self._request("DELETE", "/subscriptions", params={"url": url})
+        if result.get("success") is not True:
+            raise MaxApiError("MAX Webhook removal was not confirmed", code="unsubscribe_rejected")
+        return result
+
+    async def get_updates(
+        self,
+        *,
+        marker: Optional[int] = None,
+        timeout: int = 30,
+        limit: int = 100,
+        types: Optional[Iterable[str]] = None,
+    ) -> Mapping[str, Any]:
+        if not 0 <= timeout <= 90:
+            raise ValueError("MAX polling timeout must be between 0 and 90 seconds")
+        if not 1 <= limit <= 1000:
+            raise ValueError("MAX polling limit must be between 1 and 1000")
+        params: dict[str, Any] = {"timeout": timeout, "limit": limit}
+        if marker is not None:
+            params["marker"] = marker
+        if types is not None:
+            params["types"] = ",".join(types)
+        result = await self._request("GET", "/updates", params=params)
+        updates = result.get("updates")
+        if not isinstance(updates, list) or any(not isinstance(item, Mapping) for item in updates):
+            raise MaxApiError("MAX API returned an invalid updates list", code="invalid_updates")
+        marker_value = result.get("marker")
+        if marker_value is not None and (
+            isinstance(marker_value, bool) or not isinstance(marker_value, int) or marker_value < 0
+        ):
+            raise MaxApiError("MAX API returned an invalid polling marker", code="invalid_marker")
+        return result

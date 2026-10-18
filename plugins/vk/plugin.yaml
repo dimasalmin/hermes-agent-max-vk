@@ -1,0 +1,71 @@
+name: vk
+label: VKontakte
+kind: platform
+version: 0.3.0
+description: >
+  Русский: адаптер Hermes Agent для сообществ VK с Community Long Poll,
+  нативными callback-событиями и ограниченным транспортом медиа.
+  English: Hermes Agent adapter for VK community bots using Community Long
+  Poll, native callbacks, and bounded media transport.
+author: Hermes Agent MAX and VK contributors
+license: MIT
+homepage: https://github.com/dimasalmin/hermes-agent-max-vk
+
+requires_env:
+  - name: VK_GROUP_TOKEN
+    description: "Ключ доступа сообщества VK; community access token"
+    prompt: "Ключ доступа сообщества VK"
+    password: true
+    category: messaging
+    url: "https://github.com/dimasalmin/hermes-agent-max-vk/blob/main/docs/ru/vk-setup.md"
+  - name: VK_GROUP_ID
+    description: "Числовой ID сообщества VK; numeric group/community ID"
+    prompt: "Числовой ID сообщества VK"
+    category: messaging
+
+optional_env:
+  - name: VK_ALLOWED_USERS
+    description: "Comma-separated VK user IDs allowed in DM and chats"
+    category: messaging
+  - name: VK_GROUP_ALLOWED_USERS
+    description: "User IDs allowed in multi-user chats only"
+    category: messaging
+  - name: VK_GROUP_ALLOWED_CHATS
+    description: "peer_id values of chats where any member can invoke the bot"
+    category: messaging
+  - name: VK_ALLOW_ALL_USERS
+    description: "Set to true to disable allowlisting; use only after review"
+    category: messaging
+  - name: VK_GUEST_MODE
+    description: "Allow non-allowlisted chats on explicit mention"
+    category: messaging
+  - name: VK_DM_POLICY
+    description: "DM policy: allowlist, pairing, open or disabled"
+    category: messaging
+  - name: VK_GROUP_POLICY
+    description: "Group policy: allowlist, open or disabled"
+    category: messaging
+  - name: VK_PAIRING_TTL_SECONDS
+    description: "Lifetime of an operator-issued pairing code"
+    category: messaging
+  - name: VK_POLL_LOCK_TTL_SECONDS
+    description: "Lease protecting one Community Long Poll worker per state path"
+    category: messaging
+  - name: VK_HOME_CHANNEL
+    description: "peer_id receiving scheduled/cron deliveries"
+    category: messaging
+  - name: VK_API_VERSION
+    description: "Override VK API version; default is 5.199"
+    category: messaging
+  - name: VK_STATE_PATH
+    description: "SQLite path for Long Poll marker and inbound deduplication"
+    category: messaging
+  - name: VK_MEDIA_MAX_BYTES
+    description: "Maximum size of one downloaded or uploaded attachment"
+    category: messaging
+  - name: VK_CALLBACK_TTL_SECONDS
+    description: "Lifetime of native callback payloads"
+    category: messaging
+  - name: VK_POLL_WAIT
+    description: "Community Long Poll wait timeout in seconds"
+    category: messaging

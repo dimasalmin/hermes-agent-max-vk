@@ -1,0 +1,92 @@
+name: max-platform
+label: MAX
+kind: platform
+version: 0.2.4
+description: >
+  Внешний адаптер Hermes Agent для MAX Bot API v2. Поддерживает REST API
+  platform-api2.max.ru, HTTPS Webhook для постоянной работы и Long Polling для
+  разработки и проверок. Использует строгий список разрешённых пользователей
+  и проверку TLS.
+author: Hermes Agent RU Messenger contributors
+license: MIT
+homepage: https://github.com/NousResearch/hermes-agent
+
+requires_env:
+  - name: MAX_BOT_TOKEN
+    description: "Токен бота, созданный в MAX для бизнеса"
+    prompt: "Токен MAX Bot API"
+    password: true
+    category: messaging
+    url: "https://business.max.ru/"
+
+optional_env:
+  - name: MAX_ALLOWED_USERS
+    description: "Разрешённые ID пользователей MAX через запятую"
+    prompt: "Разрешённые пользователи MAX"
+    password: false
+    category: messaging
+  - name: MAX_GROUP_ALLOWED_USERS
+    description: "Разрешённые в группах ID пользователей через запятую"
+    prompt: "Разрешённые участники групп MAX"
+    password: false
+    category: messaging
+  - name: MAX_GROUP_ALLOWED_CHATS
+    description: "Разрешённые ID групповых чатов через запятую"
+    prompt: "Разрешённые групповые чаты MAX"
+    password: false
+    category: messaging
+  - name: MAX_ADMIN_USERS
+    description: "ID пользователей, которым разрешены подтверждения и управление в группах"
+    prompt: "Администраторы групп MAX"
+    password: false
+    category: messaging
+  - name: MAX_ALLOW_ALL_USERS
+    description: "Только для разработки: отключает проверку списка разрешённых пользователей"
+    prompt: "Разрешить всех пользователей MAX?"
+    password: false
+    category: messaging
+  - name: MAX_WEBHOOK_URL
+    description: "Публичный HTTPS-адрес Webhook на порту 443"
+    prompt: "Адрес Webhook MAX"
+    password: false
+    category: messaging
+  - name: MAX_WEBHOOK_SECRET
+    description: "Секрет для заголовка X-Max-Bot-Api-Secret"
+    prompt: "Секрет Webhook MAX"
+    password: true
+    category: messaging
+  - name: MAX_CA_BUNDLE
+    description: "Необязательный PEM-файл с доверенной цепочкой сертификатов MAX"
+    prompt: "Путь к PEM-файлу сертификатов MAX"
+    password: false
+    category: messaging
+  - name: MAX_API_BASE_URL
+    description: "Расширенная настройка; по умолчанию https://platform-api2.max.ru"
+    prompt: "Базовый адрес MAX API"
+    password: false
+    category: messaging
+  - name: MAX_INBOX_PATH
+    description: "Общий путь SQLite-очереди для Hermes и Webhook-приёмника"
+    prompt: "Путь к SQLite-очереди MAX Webhook"
+    password: false
+    category: messaging
+  - name: MAX_MARKER_PATH
+    description: "Путь к SQLite-файлу маркера Long Polling"
+    prompt: "Путь к маркеру Long Polling MAX"
+    password: false
+    category: messaging
+  - name: MAX_TARGET_PATH
+    description: "Путь к SQLite-файлу с типами диалогов и групп MAX"
+    prompt: "Путь к состоянию чатов MAX"
+    password: false
+    category: messaging
+  - name: MAX_CALLBACK_TTL_SECONDS
+    description: "Срок действия нажатий кнопок MAX в секундах"
+    prompt: "Срок действия кнопок MAX"
+    password: false
+    category: messaging
+  - name: MAX_MEDIA_MAX_BYTES
+    description: "Максимум одного входящего или исходящего вложения; не более 50000000 байт"
+    prompt: "Размер вложения MAX в байтах, не более 50000000"
+    password: false
+    category: messaging
