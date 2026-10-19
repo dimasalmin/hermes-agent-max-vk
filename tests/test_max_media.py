@@ -775,7 +775,7 @@ async def test_group_session_id_is_translated_back_to_real_max_chat() -> None:
 
 
 @pytest.mark.asyncio
-async def test_typing_actions_use_documented_group_action_and_skip_dm() -> None:
+async def test_typing_actions_use_documented_group_action_and_skip_unmapped_dm() -> None:
     class _Client:
         def __init__(self) -> None:
             self.actions = []
@@ -793,7 +793,7 @@ async def test_typing_actions_use_documented_group_action_and_skip_dm() -> None:
     await adapter.stop_typing("group-1::user::member-1")
     await adapter.send_typing("user-1")
 
-    assert adapter._client.actions == [("group-1", "typing_on"), ("group-1", "typing_off")]
+    assert adapter._client.actions == [("group-1", "typing_on")]
 
 
 def test_max_text_chunks_preserve_every_character() -> None:

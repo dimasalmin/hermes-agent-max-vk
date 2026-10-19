@@ -558,6 +558,7 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
         self._bot_user_id: Optional[str] = None
         self._bot_username: Optional[str] = None
         self._chat_target_types: dict[str, str] = {}
+        self._dm_action_chat_ids: dict[str, str] = {}
         self._webhook_mode = bool(self._webhook_url)
         default_inbox = _max_home()
         self._inbox_path = str(
@@ -710,6 +711,7 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
         self._worker_tasks.clear()
         self._chat_dispatch_locks.clear()
         self._chat_media_download_locks.clear()
+        self._dm_action_chat_ids.clear()
         self._model_pickers.clear()
         if self._client is not None:
             await self._client.close()
@@ -1284,7 +1286,31 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
             return "accepted"
         return "consumed" if getattr(event, "_max_gateway_consumed", False) else "rejected"
 
+    def _remember_dialog_action_chat(self, event: Any) -> None:
+        source = getattr(event, "source", None)
+        target_id = str(getattr(source, "chat_id", "") or "")
+        raw = getattr(event, "raw_message", None)
+        recipient = raw.get("recipient") if isinstance(raw, Mapping) else None
+        if not target_id or not isinstance(recipient, Mapping):
+            return
+        if recipient.get("chat_type") != "dialog":
+            return
+        value = recipient.get("chat_id")
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            return
+        try:
+            internal_id = int(value)
+        except (ValueError, TypeError):
+            return
+        if not internal_id or not -(2**63) <= internal_id < 2**63:
+            return
+        # Only admitted turns populate this map. Session/reply IDs remain user IDs.
+        if not hasattr(self, "_dm_action_chat_ids"):
+            self._dm_action_chat_ids = {}
+        self._dm_action_chat_ids[target_id] = str(internal_id)
+
     async def on_processing_start(self, event: Any) -> None:
+        self._remember_dialog_action_chat(event)
         metadata = getattr(event, "metadata", None) or {}
         event_key = metadata.get("max_update_event_key") if isinstance(metadata, Mapping) else None
         if event_key:
@@ -2301,27 +2327,26 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         transport_chat_id = _transport_chat_id(chat_id, metadata)
-        if self._client is None or self._target_type_for(transport_chat_id, metadata) != "chat":
+        if self._client is None:
+            return
+        if self._target_type_for(transport_chat_id, metadata) == "chat":
+            action_chat_id = transport_chat_id
+        else:
+            action_chat_id = getattr(self, "_dm_action_chat_ids", {}).get(transport_chat_id)
+        if not action_chat_id:
             return
         try:
             await self._rate_limiter.acquire(transport_chat_id)
             await with_backoff(
-                lambda: self._client.send_action(transport_chat_id, "typing_on"),
+                lambda: self._client.send_action(action_chat_id, "typing_on"),
                 is_rate_limit=_is_max_rate_limit,
                 extract_retry_after=_retry_after,
             )
         except (MaxApiError, ValueError) as exc:
-            logger.warning("MAX typing_on action failed: %s", exc)
+            logger.debug("MAX typing_on action failed (status=%s)", getattr(exc, "status_code", None))
 
-    async def stop_typing(self, chat_id: str) -> None:
-        transport_chat_id = _transport_chat_id(chat_id)
-        if self._client is None or self._target_type_for(transport_chat_id) != "chat":
-            return
-        try:
-            await self._rate_limiter.acquire(transport_chat_id)
-            await self._client.send_action(transport_chat_id, "typing_off")
-        except (MaxApiError, ValueError) as exc:
-            logger.warning("MAX typing_off action failed: %s", exc)
+    async def stop_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+        """Hermes stops renewal; MAX documents no explicit typing_off action."""
 
     async def send(
         self,

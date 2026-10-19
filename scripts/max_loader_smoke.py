@@ -154,12 +154,48 @@ def main() -> int:
         if not result.error or result.error_kind != "partial_media":
             raise RuntimeError("send_multiple_images hid a partial image-delivery failure")
 
+    async def verify_typing_contract() -> None:
+        typing_adapter = module.MaxAdapter(PlatformConfig(enabled=True, token="offline-typing-token"))
+        actions = []
+        repeated = asyncio.Event()
+
+        async def fake_action(chat_id, action):
+            actions.append((chat_id, action))
+            if len(actions) >= 2:
+                repeated.set()
+            return {"success": True}
+
+        async def no_wait(chat_id):
+            pass
+
+        typing_adapter._client = types.SimpleNamespace(send_action=fake_action)
+        typing_adapter._rate_limiter = types.SimpleNamespace(acquire=no_wait)
+        event = module.adapter._build_message_event(typing_adapter, audio_message)
+        await typing_adapter.on_processing_start(event)
+        if event.source.chat_id != "123":
+            raise RuntimeError("Typing mapping changed the Hermes DM session ID")
+        task = asyncio.create_task(typing_adapter._keep_typing("123", interval=0.01))
+        try:
+            await asyncio.wait_for(repeated.wait(), timeout=2)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        count = len(actions)
+        await asyncio.sleep(0.03)
+        if len(actions) != count or any(item != ("456", "typing_on") for item in actions):
+            raise RuntimeError("Native typing refresh used an invalid target/action or continued after stop")
+        typing_adapter._client = None
+
     previous_log_disable = logging.root.manager.disable
     try:
         logging.disable(logging.WARNING)
         asyncio.run(verify_send_result_contract())
+        asyncio.run(verify_typing_contract())
     except Exception as exc:  # noqa: BLE001 - report the contract failure clearly
-        raise SystemExit(f"MAX native media contract failed: {exc}") from exc
+        raise SystemExit(f"MAX native adapter contract failed: {exc}") from exc
     finally:
         logging.disable(previous_log_disable)
 
@@ -170,6 +206,7 @@ def main() -> int:
     print("native_processing_hooks=ok")
     print("native_empty_admin_policy=ok")
     print("native_audio_stt_routing=ok")
+    print("native_typing_refresh_contract=ok")
     print(f"hooks={','.join(sorted(required))}")
     print("writes_hermes_core=no")
     return 0
