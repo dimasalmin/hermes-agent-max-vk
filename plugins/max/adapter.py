@@ -493,6 +493,48 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
     supports_code_blocks = False
     SUPPORTS_MESSAGE_EDITING = True
 
+    async def handle_message(self, event: Any) -> None:
+        with russian_commands():
+            runner = getattr(self, "gateway_runner", None)
+            get_command = getattr(event, "get_command", None)
+            if (callable(get_command) and get_command() == "queue"
+                    and not callable(getattr(runner, "_handle_queue_command", None))):
+                args = event.get_command_args().strip()
+                if not args or args.split()[0].lower() in {"list", "status", "edit", "rm", "move", "clear"}:
+                    await self._reply_queue_control(event, args)
+                    event._max_gateway_consumed = True
+                    return
+                if args.split()[0].lower() == "add":
+                    args = args[3:].strip()
+                    if not args:
+                        await self._reply_queue_control(event, "")
+                        event._max_gateway_consumed = True
+                        return
+                    event.text = "/queue " + args
+                key_fn = getattr(self, "_event_session_key", None)
+                key = key_fn(event) if callable(key_fn) else None
+                busy = key is not None and key in getattr(self, "_active_sessions", {})
+                running = getattr(runner, "_is_session_running", None)
+                busy = busy or bool(key is not None and callable(running) and running(key))
+                if not busy:
+                    # Idle queue items are normal turns. The native FIFO still owns pending work.
+                    event.text = args
+            return await super().handle_message(event)
+
+    async def _reply_queue_control(self, event: Any, args: str) -> None:
+        runner = getattr(self, "gateway_runner", None)
+        count_fn = getattr(runner, "_queue_depth", None)
+        key_fn = getattr(runner, "_session_key_for_source", None)
+        if callable(count_fn) and callable(key_fn):
+            count = count_fn(key_fn(event.source), adapter=self)
+            text = f"В очереди запросов: {int(count)}.\nДобавить запрос: /queue <текст>."
+        else:
+            text = "Состояние очереди недоступно. Подключение к Hermes ещё не завершено."
+        if args and args.split()[0].lower() in {"edit", "rm", "move", "clear"}:
+            text += "\nЭта версия gateway не поддерживает редактирование очереди. Действие не выполнено."
+        metadata = dict(getattr(event, "metadata", None) or {})
+        await self.send(event.source.chat_id, text, metadata=metadata)
+
     def set_message_handler(self, handler) -> None:
         async def localized(event):
             context = {"adapter": id(self), "metadata": dict(getattr(event, "metadata", None) or {}),
@@ -784,7 +826,7 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
             "retry": "Повторить последнее сообщение",
             "undo": "Отменить последний ход",
             "agents": "Активные задачи",
-            "queue": "Просмотр и управление очередью запросов",
+            "queue": "Показать очередь или добавить запрос",
             "background": "Запустить в фоне",
             "whoami": "Проверить доступ",
         }
@@ -1401,6 +1443,11 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
     async def _handle_local_command(self, message: MaxMessage) -> bool:
         command = _command_name(message.text)
+        if command == "queue" and not callable(getattr(getattr(self, "gateway_runner", None), "_handle_queue_command", None)):
+            args = message.text.strip().partition(" ")[2].strip()
+            if not args or args.split()[0].lower() in {"list", "status", "edit", "rm", "move", "clear"}:
+                await self._reply_queue_control(_build_message_event(self, message), args)
+                return True
         if command == "menu":
             await self._send_menu(
                 message.chat_id,
@@ -1429,6 +1476,10 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
         return False
 
     async def _dispatch_callback(self, callback: MaxCallback) -> None:
+        with russian_commands():
+            await self._dispatch_callback_impl(callback)
+
+    async def _dispatch_callback_impl(self, callback: MaxCallback) -> None:
         """Resolve a MAX button through Hermes' native interactive hooks."""
 
         self._remember_group_user(callback.chat_id, callback.user_id, is_group=callback.is_group)

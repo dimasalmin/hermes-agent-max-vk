@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from plugins.max.adapter import MaxAdapter
+from plugins.max.adapter import BasePlatformAdapter
 from plugins.max.common import AccessPolicy
 from plugins.max.interactive import MaxCallbackStore
 from plugins.max.models import MaxCallback, MaxMessage
@@ -199,3 +200,38 @@ async def test_unprivileged_group_picker_is_not_sent():
         metadata={'max_target_type': 'chat', 'max_user_id': 'user-1'})
     assert not result.success
     obj._client.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_queue_management_is_never_forwarded_as_model_prompt():
+    obj = adapter()
+    obj.gateway_runner = SimpleNamespace(_session_key_for_source=lambda source: 'own-session',
+        _queue_depth=lambda key, **kw: 3)
+    obj.build_source = lambda **kw: SimpleNamespace(**kw)
+    obj.send = AsyncMock()
+    for text in ('/queue', '/queue list', '/queue clear', '/queue edit 1 example'):
+        message = MaxMessage(message_id='synthetic', user_id='user-1', user_name=None,
+            chat_id='user-1', chat_type='dialog', chat_title=None, text=text)
+        assert await obj._handle_local_command(message)
+    assert '3' in obj.send.call_args.args[1]
+    assert 'не поддерживает' in obj.send.call_args.args[1]
+    obj.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('busy', [False, True])
+async def test_queue_text_uses_native_turn_or_native_fifo(monkeypatch, busy):
+    obj = adapter()
+    # Remove this fixture's LLM tripwire to exercise the actual adapter method.
+    del obj.handle_message
+    obj.gateway_runner = SimpleNamespace(_is_session_running=lambda key: busy)
+    obj._event_session_key = lambda event: 'own-session'
+    obj._active_sessions = {'own-session': object()} if busy else {}
+    seen = []
+    async def native(self, event):
+        seen.append(event.text)
+    monkeypatch.setattr(BasePlatformAdapter, 'handle_message', native)
+    event = SimpleNamespace(text='/queue add synthetic prompt', get_command=lambda: 'queue',
+        get_command_args=lambda: 'add synthetic prompt')
+    await obj.handle_message(event)
+    assert seen == ['/queue synthetic prompt' if busy else 'synthetic prompt']

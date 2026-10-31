@@ -1,7 +1,7 @@
 name: max-platform
 label: MAX
 kind: platform
-version: 0.2.6
+version: 0.2.7
 description: >
   Внешний адаптер Hermes Agent для MAX Bot API v2. Поддерживает REST API
   platform-api2.max.ru, HTTPS Webhook для постоянной работы и Long Polling для
