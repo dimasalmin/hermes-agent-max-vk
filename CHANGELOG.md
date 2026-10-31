@@ -1,14 +1,36 @@
-# Changelog
+# Журнал Изменений
+
+## MAX 0.2.7 — 2026-10-31
+
+- Добавлены русские одноразовые кнопки `/reasoning` через штатный интерфейс
+  выбора Hermes: текущий уровень, отмена и защита от чужих, повторных и
+  устаревших нажатий. Выбор не создаёт запрос к модели.
+- Восстановлен штатный `/commands [страница]`, включая пагинацию.
+- Меню личного и общего бота строится из одного генератора; доступны
+  `/goal` и `/reasoning`, если они подтверждены реестром установленного Hermes.
+  Общий список регистрирует один доверенный компонент, не каждый профиль.
+- Русский контекст команд ограничен адаптером MAX: глобальный язык,
+  настройки Telegram и секреты других профилей не изменяются.
+- В версиях Hermes без управления очередью `/queue list` показывает число
+  ожидающих запросов; неподдерживаемое редактирование явно отклоняется и
+  не передаётся модели как текст. Постановка запросов использует очередь Hermes.
+- Доработан индикатор «печатает» в личных диалогах: внутренний ID диалога
+  используется только для действия, адресация ответов и сессий не меняется.
+  Недокументированное действие `typing_off` не отправляется.
+- Добавлены регрессионные тесты и русский справочник команд. Локальный набор:
+  339 тестов пройдено, один необязательный HEIC-тест пропущен при отсутствии
+  `pillow_heif`. Это не заменяет проверку интерфейса на телефоне.
+- Изменения остаются во внешнем плагине; ядро Hermes и плагин VK не меняются.
 
 ## 0.1.0 - 2026-08-09
 
-- First public packaging of the external MAX and VK Hermes platform plugins.
-- Added deterministic contract coverage for API clients, callbacks, media,
-  allowlists, durable state, and standalone VK export.
-- Local verification: 133 tests passed; live MAX/VK acceptance remains open.
-- Added public installation, security, contribution, and CI documentation.
+- Первая публичная упаковка внешних плагинов Hermes для MAX и VK.
+- Добавлены детерминированные проверки API-клиентов, callbacks, медиа,
+  списков доступа, устойчивого состояния и отдельного экспорта VK.
+- На этом этапе локально пройдено 133 теста; живая приёмка MAX/VK оставалась открытой.
+- Добавлена документация по установке, безопасности, участию и CI.
 
-## Unreleased
+## Ранее Добавлено
 
 - Добавлены inline-кнопки MAX для уточнений Hermes, подтверждений exec и
   slash-команд.
@@ -20,22 +42,21 @@
 - Добавлены нативные методы MAX для изображений, документов, аудио и видео,
   обработка upload-токенов, группировка медиа, разрешение video-токенов и
   отчёт о частичных ошибках внешнего плагина.
-- Добавлены `/menu`, `/start`, `/commands` и `/maxstatus`; при скрытом
-  системном меню список команд возвращается обычным текстом.
+- Добавлены `/menu`, `/start`, `/commands` и `/maxstatus`; быстрые кнопки
+  и полный каталог доступны также при скрытом системном меню.
 - Добавлена обезличенная проверка `max_commands_live_smoke.py` и запись в
   журнал точного списка команд, зарегистрированного через `PATCH /me/commands`.
 - Реализация остаётся внешним плагином; ядро Hermes не изменяется.
 
 ## 0.2.0 - 2026-08-08
 
-- Rebuilt MAX integration as an external Hermes plugin using the current v0.20.0
-  adapter contract.
-- Added direct MAX Bot API v2 client, Long Polling marker persistence, Webhook
-  secret validation, durable SQLite inbox and optional standalone ASGI ingress.
-- Added DM/group allowlist policy, MAX reply `link.mid`, persistent target type,
-  TLS fail-closed checks and global/per-dialog rate limiting.
-- Marked live media acceptance, streaming edit coalescing, health metrics and
-  live no-VPN validation as remaining release gates.
+- Интеграция MAX переведена во внешний плагин по контракту адаптера v0.20.0.
+- Добавлены прямой клиент MAX Bot API v2, сохранение позиции Long Polling,
+  проверка секрета Webhook, устойчивый SQLite inbox и отдельный ASGI-вход.
+- Добавлены списки доступа для личных и групповых чатов, MAX reply `link.mid`,
+  сохранение типа адресата, строгая проверка TLS и ограничения частоты запросов.
+- На этом этапе живая приёмка медиа, объединение потоковых правок, метрики
+  здоровья и проверка без VPN оставались условиями будущего выпуска.
 
-This release does not modify Hermes core and is not a claim of universal MAX
-availability during regional network restrictions.
+Этот выпуск не изменяет ядро Hermes и не гарантирует доступность MAX
+при региональных ограничениях связи.

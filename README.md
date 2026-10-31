@@ -65,6 +65,7 @@ MAX (Webhook или Long Polling), идентификаторы для allowlist
 - [настройка MAX](docs/ru/max-setup.md);
 - [настройка VK](docs/ru/vk-setup.md);
 - [интерактивные сценарии MAX](docs/ru/max-interactive.md);
+- [команды и выбор уровня рассуждений MAX](docs/ru/max-commands.md);
 - [зачем Hermes нужны российские мессенджеры](docs/ru/why-russian-messengers.md).
 
 После изменения Hermes запускайте loader smoke test до перезапуска production gateway. Third-party plugins в Hermes включаются явно:
@@ -89,8 +90,11 @@ python -m compileall -q plugins tests scripts
 python scripts/max_commands_live_smoke.py
 ```
 
-Если клиент MAX не показывает системное меню, команды `/start`, `/menu` и
-`/commands` возвращают тот же список обычным текстом и добавляют кнопки.
+Если клиент MAX не показывает системное меню, `/start` и `/menu` открывают
+быстрые кнопки и краткую справку. `/commands [страница]` показывает полный
+штатный каталог Hermes, а `/reasoning` — кнопки выбора уровня рассуждений.
+Личный бот и доверенный маршрутизатор общего бота используют один генератор
+меню; после обновления плагина общий список обновляет администратор маршрутизатора.
 Текущий проверенный набор и ограничения описаны в
 [русской инструкции MAX](docs/ru/max-setup.md).
 
