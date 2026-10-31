@@ -20,6 +20,8 @@ from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 from urllib.parse import unquote, urlsplit
 
+from .command_ui import COMMAND_CONTEXT, choice_label, russian_commands
+
 
 def _fallback_validate_media_delivery_path(path: str) -> Optional[str]:
     """Validate a local file when Hermes is not installed for standalone tests."""
@@ -97,6 +99,9 @@ except ImportError:  # pragma: no cover - used only by standalone unit tests
         async def handle_message(self, _event: Any) -> None:
             return None
 
+        def set_message_handler(self, handler) -> None:
+            self._message_handler = handler
+
         @staticmethod
         def validate_media_delivery_path(
             path: str, session_key: str = ""
@@ -156,10 +161,10 @@ MAX_UPDATE_TYPES = (
 GROUP_ADMIN_COMMANDS = frozenset(
     {
         "new", "stop", "model", "compress", "undo", "rollback", "sethome",
-        "restart", "approve", "deny", "background", "queue", "resume",
+        "restart", "approve", "deny", "background", "queue", "resume", "reasoning", "goal",
     }
 )
-GROUP_ADMIN_CALLBACKS = frozenset({"approval", "slash", "model"})
+GROUP_ADMIN_CALLBACKS = frozenset({"approval", "slash", "model", "choice"})
 GROUP_SESSION_SEPARATOR = "::user::"
 
 
@@ -391,6 +396,7 @@ def _build_message_event(
             "max_target_type": "chat" if message.is_group else "user",
             "max_user_id": message.user_id,
             "max_forwarded": bool(message.link and message.link.get("type") == "forward"),
+            "max_request_version": getattr(adapter, "_choice_versions", {}).get((message.chat_id, message.user_id)),
             **({"max_update_event_key": update_event_key} if update_event_key else {}),
         },
     )
@@ -487,13 +493,32 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
     supports_code_blocks = False
     SUPPORTS_MESSAGE_EDITING = True
 
+    def set_message_handler(self, handler) -> None:
+        async def localized(event):
+            context = {"adapter": id(self), "metadata": dict(getattr(event, "metadata", None) or {}),
+                       "user_id": str(getattr(getattr(event, "source", None), "user_id", "") or "")}
+            token = COMMAND_CONTEXT.set(context)
+            try:
+                with russian_commands():
+                    return await handler(event)
+            finally:
+                COMMAND_CONTEXT.reset(token)
+        super().set_message_handler(localized if handler else None)
+
     def set_busy_session_handler(self, handler) -> None:
         if handler is None:
             return super().set_busy_session_handler(None)
 
         async def observed(event, session_key):
             event._max_gateway_consumed = False
-            handled = await handler(event, session_key)
+            token = COMMAND_CONTEXT.set({"adapter": id(self),
+                "metadata": dict(getattr(event, "metadata", None) or {}),
+                "user_id": str(getattr(getattr(event, "source", None), "user_id", "") or "")})
+            try:
+                with russian_commands():
+                    handled = await handler(event, session_key)
+            finally:
+                COMMAND_CONTEXT.reset(token)
             if handled is True and getattr(event, "_bot_loop_admitted", False) is True:
                 # "Handled" includes steer/inline consumption, not a promise of a new turn.
                 event._max_gateway_consumed = True
@@ -590,6 +615,8 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
             callback_ttl = 600.0
         self._callbacks = MaxCallbackStore(ttl_seconds=callback_ttl)
         self._model_pickers: dict[str, dict[str, Any]] = {}
+        self._choice_pickers: dict[str, dict[str, Any]] = {}
+        self._choice_versions: dict[tuple[str, str], str] = {}
         self._last_group_users: dict[str, tuple[str, float]] = {}
         try:
             self._media_max_bytes = int(
@@ -713,6 +740,8 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
         self._chat_media_download_locks.clear()
         self._dm_action_chat_ids.clear()
         self._model_pickers.clear()
+        getattr(self, "_choice_pickers", {}).clear()
+        getattr(self, "_choice_versions", {}).clear()
         if self._client is not None:
             await self._client.close()
             self._client = None
@@ -740,25 +769,27 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
         descriptions = {
             "menu": "Показать кнопки Hermes",
-            "commands": "Показать список доступных команд",
+            "commands": "Все команды и навыки (постранично)",
             "maxstatus": "Состояние очереди MAX",
             "help": "Список доступных команд",
             "status": "Статус сессии и модели",
             "new": "Новая сессия",
-            "stop": "Остановить фоновые задачи",
+            "stop": "Остановить текущую задачу и фоновые процессы",
             "model": "Выбрать модель",
+            "goal": "Цель: показать, задать или продолжить",
+            "reasoning": "Выбрать уровень рассуждений",
             "compress": "Сжать контекст",
             "sessions": "Предыдущие сессии",
-            "resume": "Возобновить сессию",
+            "resume": "Список и возобновление именованных сессий",
             "retry": "Повторить последнее сообщение",
             "undo": "Отменить последний ход",
             "agents": "Активные задачи",
-            "queue": "Поставить запрос в очередь",
+            "queue": "Просмотр и управление очередью запросов",
             "background": "Запустить в фоне",
             "whoami": "Проверить доступ",
         }
         preferred = [
-            "menu", "commands", "help", "status", "new", "stop", "model", "compress",
+            "menu", "commands", "help", "status", "new", "stop", "model", "goal", "reasoning", "compress",
             "sessions", "resume", "retry", "undo", "agents", "whoami",
             "queue", "background", "maxstatus",
         ]
@@ -779,7 +810,7 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
         result: list[dict[str, str]] = []
         for name in preferred:
-            if name in {"menu", "commands", "maxstatus"}:
+            if name in {"menu", "maxstatus"}:
                 result.append({"name": name, "description": descriptions[name]})
                 continue
             item = registry.get(name)
@@ -788,7 +819,7 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 # without a Hermes checkout.  Keep only the stable session
                 # status command visible there; an installed Hermes registry
                 # remains authoritative in production.
-                if not registry_available and name in {"help", "status"}:
+                if not registry_available and name in {"help", "status", "commands"}:
                     result.append({"name": name, "description": descriptions[name]})
                 continue
             result.append(
@@ -1242,6 +1273,7 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 metadata={"max_target_type": target_type, "max_user_id": message.user_id},
             )
             return "media_failed"
+        self._note_choice_request(message.chat_id, message.user_id)
         if await self._handle_local_command(message):
             return "processed"
         event = _build_message_event(
@@ -1376,13 +1408,6 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 target_type="chat" if message.is_group else "user",
             )
             return True
-        if command == "commands":
-            await self._send_menu(
-                message.chat_id,
-                message.user_id,
-                target_type="chat" if message.is_group else "user",
-            )
-            return True
         if command == "maxstatus":
             await self.send(
                 message.chat_id,
@@ -1418,6 +1443,11 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
             return
 
         pending_entry = self._callbacks.peek(callback.payload)
+        if pending_entry is not None and pending_entry.kind == "choice":
+            state = getattr(self, "_choice_pickers", {}).get(pending_entry.value.partition(":")[0])
+            if state is not None and state["message_id"] != callback.message_id:
+                await self._answer_callback(callback, "Кнопка относится к другому сообщению.")
+                return
         if (
             callback.is_group
             and pending_entry is not None
@@ -1466,6 +1496,7 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     link={"message_id": callback.message_id} if callback.message_id else None,
                     raw_message=callback.raw_message,
                 )
+                self._note_choice_request(callback.chat_id, callback.user_id)
                 if await self._handle_local_command(command_message):
                     return
                 event = _build_message_event(self, command_message)
@@ -1550,6 +1581,10 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
             if entry.kind == "model":
                 await self._dispatch_model_callback(callback, entry.value)
+                return
+
+            if entry.kind == "choice":
+                await self._dispatch_choice_callback(callback, entry)
                 return
 
             await self._answer_callback(callback, "Неизвестная кнопка.")
@@ -1757,7 +1792,14 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
             for item in self._max_commands()
         )
         heading = "Hermes готов к работе." if welcome else "Доступные команды Hermes:"
-        return f"{heading}\n\n{command_lines}\n\nВыберите действие:"[:MAX_MESSAGE_LENGTH]
+        usage = (
+            "\n\n/reasoning — выбор уровня; /reasoning high — задать уровень в этой сессии."
+            "\n/reasoning off — скрыть вывод; /reasoning none — отключить рассуждения."
+            "\n/goal status — состояние цели; /goal <текст> — задать цель."
+            "\n/commands 2 — следующая страница полного каталога."
+            "\n--global меняет настройку всего профиля; без него уровень задаётся для сессии."
+        )
+        return f"{heading}\n\n{command_lines}{usage}\n\nВыберите действие:"[:MAX_MESSAGE_LENGTH]
 
     async def _send_menu(
         self,
@@ -1775,6 +1817,8 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
             "status": "Статус",
             "new": "Новая сессия",
             "model": "Модель",
+            "reasoning": "Уровень рассуждений",
+            "goal": "Цель",
             "stop": "Остановить",
             "compress": "Сжать контекст",
             "maxstatus": "Диагностика MAX",
@@ -1783,7 +1827,7 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
         button_names = [
             name
             for name in (
-                "commands", "help", "status", "new", "model", "stop", "compress", "maxstatus"
+                "commands", "help", "status", "new", "model", "reasoning", "goal", "stop", "compress", "maxstatus"
             )
             if name in available
         ]
@@ -2763,6 +2807,108 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
             rows,
             metadata=metadata,
         )
+
+    def _note_choice_request(self, chat_id: str, user_id: str) -> str:
+        if not hasattr(self, "_choice_versions"):
+            self._choice_versions = {}
+            self._choice_pickers = {}
+        route = (str(chat_id), str(user_id))
+        for key, state in list(self._choice_pickers.items()):
+            if state["route"] == route or state["expires_at"] <= time.monotonic():
+                self._choice_pickers.pop(key, None)
+        if len(self._choice_versions) >= 512 and route not in self._choice_versions:
+            self._choice_versions.pop(next(iter(self._choice_versions)))
+        version = token_urlsafe(12)
+        self._choice_versions[route] = version
+        return version
+
+    async def send_choice_picker(
+        self, chat_id: str, title: str, choices: list, session_key: str,
+        on_choice_selected, metadata: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """Implement Hermes' native finite-choice UI without sending a new LLM turn."""
+        if (not callable(on_choice_selected) or not isinstance(choices, list)
+                or not 1 <= len(choices) <= 58
+                or any(not isinstance(c, Mapping) or not isinstance(c.get("value"), str)
+                       or not c["value"] for c in choices)):
+            return SendResult(success=False, error="Некорректные варианты выбора MAX")
+        context = COMMAND_CONTEXT.get() or {}
+        supplied = context.get("metadata", {}) if context.get("adapter") == id(self) else {}
+        merged = {**supplied, **(metadata or {})}
+        if context.get("adapter") == id(self) and context.get("user_id"):
+            merged["max_user_id"] = context["user_id"]
+        bound = self._interactive_context(chat_id, merged)
+        if bound is None:
+            return SendResult(success=False, error="Выбор MAX требует привязки к пользователю")
+        target_type, user_id = bound
+        if target_type == "chat" and not self._access.is_admin(user_id):
+            return SendResult(success=False, error="Выбор доступен только администратору группы")
+        transport = _transport_chat_id(chat_id, merged)
+        route = (transport, user_id)
+        if not hasattr(self, "_choice_versions"):
+            self._choice_versions, self._choice_pickers = {}, {}
+        version = merged.get("max_request_version") or self._choice_versions.get(route)
+        if version and self._choice_versions.get(route) != version:
+            return SendResult(success=False, error="Запрос выбора уже устарел")
+        version = version or self._note_choice_request(*route)
+        for key, state in list(self._choice_pickers.items()):
+            if state["expires_at"] <= time.monotonic() or state["route"] == route:
+                self._choice_pickers.pop(key, None)
+        while len(self._choice_pickers) >= 8:
+            self._choice_pickers.pop(next(iter(self._choice_pickers)))
+        picker_id = token_urlsafe(9)
+        state = {"route": route, "version": version, "session_key": str(session_key),
+                 "choices": [dict(c) for c in choices], "callback": on_choice_selected,
+                 "expires_at": time.monotonic() + 600, "message_id": None}
+        self._choice_pickers[picker_id] = state
+        rendered = []
+        for index, choice in enumerate(choices):
+            label = choice_label(choice["value"], str(choice.get("label") or choice["value"]))
+            if choice.get("is_current"):
+                label = "✓ " + label
+            payload = self._callbacks.issue("choice", f"{picker_id}:{index}", user_id=user_id,
+                chat_id=transport, session_key=str(session_key))
+            rendered.append({"type": "callback", "text": label[:60], "payload": payload})
+        rows = [rendered[i:i + 2] for i in range(0, len(rendered), 2)]
+        cancel = self._callbacks.issue("choice", f"{picker_id}:cancel", user_id=user_id,
+            chat_id=transport, session_key=str(session_key))
+        rows.append([{"type": "callback", "text": "Отмена", "payload": cancel}])
+        result = await self._send_interactive_prompt(transport, str(title), rows, metadata=merged)
+        if not getattr(result, "success", False) or not getattr(result, "message_id", None):
+            self._choice_pickers.pop(picker_id, None)
+            return result if not getattr(result, "success", False) else SendResult(
+                success=False, error="MAX не подтвердил сообщение выбора")
+        state["message_id"] = str(result.message_id)
+        return result
+
+    async def _dispatch_choice_callback(self, callback: MaxCallback, entry: Any) -> None:
+        picker_id, _, selection = entry.value.partition(":")
+        state = getattr(self, "_choice_pickers", {}).get(picker_id)
+        if (state is None or state["expires_at"] <= time.monotonic()
+                or state["route"] != (callback.chat_id, callback.user_id)
+                or state["session_key"] != entry.session_key
+                or state["message_id"] != callback.message_id
+                or self._choice_versions.get(state["route"]) != state["version"]):
+            await self._answer_callback(callback, "Выбор устарел. Вызовите команду заново.")
+            return
+        if selection != "cancel" and (not selection.isdigit() or int(selection) >= len(state["choices"])):
+            await self._answer_callback(callback, "Некорректный вариант выбора.")
+            return
+        # Pop before awaiting: simultaneous taps on different buttons apply at most one choice.
+        self._choice_pickers.pop(picker_id, None)
+        if selection == "cancel":
+            await self._answer_callback(callback, "Выбор отменён.", attachments=[])
+            return
+        try:
+            with russian_commands():
+                result = state["callback"](callback.chat_id, state["choices"][int(selection)]["value"])
+                if inspect.isawaitable(result):
+                    result = await result
+            text = str(result or "Выбор применён.")
+        except Exception as exc:
+            logger.warning("MAX choice callback failed (%s)", type(exc).__name__)
+            text = "Не удалось применить выбор. Вызовите команду заново."
+        await self._answer_callback(callback, text, attachments=[])
 
     async def send_model_picker(
         self,
